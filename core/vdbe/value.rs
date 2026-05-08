@@ -1357,18 +1357,19 @@ impl Value {
 /// matching SQLite's `printf("%.*f", ...)` behaviour.
 ///
 /// Rust's `format!("{f:.precision$}")` uses banker's rounding (round-half-to-even),
-/// which makes `ROUND(2.25, 1)` return `2.2` instead of SQLite's `2.3`. Naively
-/// switching to a `(f * 10^precision).round() / 10^precision` rescale would also
-/// be wrong: `0.15 * 10` rounds up to *exactly* `1.5` in IEEE 754 (because the
-/// f64 for 0.15 is `0.149999…994`), so the rescaled approach incorrectly produces
-/// `0.2`, while SQLite's printf-on-the-decimal-expansion approach correctly
-/// produces `0.1`.
+/// which makes `ROUND(2.25, 1)` return `2.2` instead of SQLite's `2.3`. The
+/// obvious-looking fix `(f * 10^precision).round() / 10^precision` is also
+/// wrong, but for a different reason: `0.15` in f64 is `0.149999…994`, but
+/// multiplying by `10` rounds up to *exactly* `1.5` in IEEE 754, so the rescale
+/// produces `0.2` while SQLite returns `0.1` (because the actual stored value
+/// is below halfway).
 ///
-/// Instead, we work directly on the f64's decimal expansion: format with enough
-/// fractional digits to capture every meaningful bit (35 — well beyond f64's
-/// ~17 significant digits), then look at the digit at position `precision`. If
-/// it is `>= '5'` we increment the kept prefix in magnitude (with carry into the
-/// integer part); otherwise we truncate. Negative sign is reattached at the end.
+/// Hybrid strategy. The fast path uses `f64::round` (which is itself
+/// round-half-away-from-zero) on `abs_f * 10^precision`. The trap above only
+/// fires when the rescaled value lands *exactly* on `N + 0.5` — at that point
+/// we don't know which side of halfway the input was on, so we fall back to
+/// inspecting the f64's decimal expansion directly. Most calls (any input not
+/// at, or appearing to be at, a decimal halfway boundary) take the fast path.
 ///
 /// Precondition: `1 <= precision <= 30` and `f` is finite within the i64-safe
 /// range (callers handle the precision-zero and out-of-range cases).
@@ -1377,8 +1378,30 @@ fn round_half_away_from_zero(f: f64, precision: usize) -> f64 {
     let sign_negative = f.is_sign_negative();
     let abs_f = f.abs();
 
-    // 35 fractional digits exceeds f64's precision so the digit we look at to
-    // decide rounding is meaningful, not noise.
+    let multiplier = 10f64.powi(precision as i32);
+    let scaled = abs_f * multiplier;
+    let int_part = scaled.trunc();
+    let abs_result = if scaled - int_part != 0.5 {
+        // Not at FP halfway — `f64::round` (round-half-away-from-zero) is
+        // safe and avoids any string allocation.
+        scaled.round() / multiplier
+    } else {
+        round_via_decimal_string(abs_f, precision)
+    };
+
+    if sign_negative {
+        -abs_result
+    } else {
+        abs_result
+    }
+}
+
+/// Slow path for `round_half_away_from_zero`: format the f64 with enough
+/// fractional digits to capture every meaningful bit (35 — well past f64's
+/// ~17 significant digits), then inspect the digit at position `precision`.
+/// If it is `>= '5'` increment the kept prefix in magnitude (with carry into
+/// the integer part); otherwise truncate.
+fn round_via_decimal_string(abs_f: f64, precision: usize) -> f64 {
     const EXTRA_DIGITS: usize = 35;
     let formatted = format!("{abs_f:.EXTRA_DIGITS$}");
     let dot = formatted
@@ -1395,14 +1418,9 @@ fn round_half_away_from_zero(f: f64, precision: usize) -> f64 {
         format!("{int_part}.{}", &frac_part[..precision])
     };
 
-    let abs_result: f64 = rounded
+    rounded
         .parse()
-        .expect("rounded decimal string should parse as f64");
-    if sign_negative {
-        -abs_result
-    } else {
-        abs_result
-    }
+        .expect("rounded decimal string should parse as f64")
 }
 
 /// Add 1 to the magnitude of the decimal `int_str.frac_str`, propagating carry
